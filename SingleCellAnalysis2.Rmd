@@ -1,0 +1,192 @@
+---
+title: "SingleCellAnalysis2"
+author: "JuHyunJeon"
+date: "2023-05-23"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Single Cell Analysis - Part 2
+
+This single cell analysis follows the YouTube tutorial on single cell analysis pipeline.
+
+## Import libraries
+
+```{r import-library, results='hide'}
+library(harmony)
+library(Seurat)
+library(SeuratData)
+library(tidyverse)
+library(ggplot2)
+```
+
+## Integrate Data using Harmony
+
+### What does Harmony do?
+
+Harmony tries to solve the issue of integrating multiple data sets with different biological difference and technical differences.
+Unlike other single cell analysis tools, Harmony takes into account both experimental and biological factors.
+Harmony groups cells starting with PCA embedding and use soft clustering (assigning cells to multiple clusters).
+Clusters with disproportionate representation from a small subset of data set is penalized by the information theoretic metric.
+After clustering, each data set has a cluster-specific centroid and Harmony computes cluster-specific linear correction factors.
+Harmony learns this linear correction factor specific to each cells.
+Harmony will iterate this process until convergence.
+
+More about Harmony can be found in this [paper](https://www.biorxiv.org/content/10.1101/461954v2)
+
+### How does it differ from Seurat's method?
+
+Seurat uses CCA(Canonical Correlation Analysis) and finds anchor points to integrate datasets.
+Harmony only gives back the embedding which we will go over in the following codes.
+
+## Harmony Study Design
+
+Goal of the study: To assess cell-type-specific changes in gene expression with given treatment
+
+Design: PBMCs from 8 lupus patients split into control and stimulated group treated with the treatment
+
+Goal of the analysis: to integrate data by conditions, overlay cells similar in both conditions.
+
+### Install and Load Dataset
+
+```{r load-dataset, results ='hide'}
+# AvailableData()
+# Can give you all the available datasets and the descriptions
+
+# Install dataset
+InstallData("ifnb")
+# Load dataset
+LoadData("ifnb")
+```
+
+```{r show-ifnb}
+str(ifnb)
+```
+### Quality Control and Filter Dataset
+
+```{r, qc-filter}
+# Calculate mitochondrial RNA percentage
+ifnb$percent_mt = PercentageFeatureSet(ifnb, pattern = '^MT-')
+
+# Check your meta data before proceeding
+# View(ifnb@meta.data)
+
+ifnb <- subset(ifnb, subset = nCount_RNA > 800 & nFeature_RNA > 200 & percent_mt < 5)
+```
+### Standard Workflow
+
+```{r, std-workflow}
+ifnb <- NormalizeData(ifnb)
+ifnb <- FindVariableFeatures(ifnb)
+ifnb <- ScaleData(ifnb)
+ifnb <- RunPCA(ifnb)
+ElbowPlot(ifnb)
+ifnb <- RunUMAP(ifnb, dims = 1:20, reduction = 'pca')
+p1 <- DimPlot(ifnb, reduction = 'umap', group.by='stim')
+p1
+# ifnb <- ifnb %>% 
+#   NormalizeData()  %>%
+#   FindVariableFeatures() %>%
+#   ScaleData() %>%
+#   RunPCA()
+```
+
+### Run Harmony to integrate the cells
+
+This follows the harmony vignette.
+
+```{r harmony}
+ifnb_harmony <- ifnb   %>%
+  RunHarmony(group.by.vars = 'stim', plot_convergence = FALSE)
+#ifnb_harmony@reductions
+
+ifnb_har_embed <- Embeddings(ifnb_harmony, "harmony")
+ifnb_har_embed[1:10, 1:10]
+```
+
+### Do UMAP and clustering using Harmony embeddings
+```{r harmony-analysis, results = "hide"}
+ifnb_harmony <- ifnb_harmony %>%
+  RunUMAP(reduction = "harmony", dims = 1:20) %>%
+  FindNeighbors(reduction = "harmony", dims = 1:20) %>%
+  FindClusters(resolution = 0.5)
+```
+
+```{r}
+p2 <- DimPlot(ifnb_harmony, reduction = "umap",  group.by = "stim")
+p1 + p2
+```
+We have successfully integrated using Harmony
+
+## Find Markers and Cluster Identification
+
+- FindMarkers(): This function does best when you want to get which genes differentiate the most between two clusters.
+
+- FindAllMarkers(): This function is best when you want to compare between one cluster vs all the other clusters and give the genes that are differentially expressed.
+
+- FindConservedMarkers(): This function finds markers conserved across conditions.
+
+### Find Markers
+
+```{r visualize-data}
+p3 <- DimPlot(ifnb_harmony, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+p4 <- DimPlot(ifnb_harmony, reduction = "umap", group.by = "stim")
+p3 + p4
+```
+
+```{r find-markers}
+# Default has to be RNA
+DefaultAssay(ifnb_harmony)
+# DefaultAssay(ifnb_harmony) <- "RNA"
+
+FindAllMarkers(ifnb_harmony,
+               logfc.threshold = 0.25,
+               min.pct = 0.1,
+               only.pos = TRUE,
+               test.use = "DESeq2",
+               slot = "counts")
+
+# Find Conserved markers, lets say you want to compare 3 vs all the others
+
+cluster3_marker <-FindConservedMarkers(ifnb_harmony,
+                                       ident.1 = 3,
+                                       grouping.var = "stim")
+
+head(cluster3_marker)
+FeaturePlot(ifnb_harmony, features = c("FCGR3A"), min.cutoff = "q10")
+```
+
+We want to rename cluster3 because FCGR3A gene represents cd16 monocytes
+
+```{r rename-idents}
+Idents(ifnb_harmony)[20:40]
+ifnb_harmony <- RenameIdents(ifnb_harmony, "3" = "CD16 Mono")
+Idents(ifnb_harmony)[20:40]
+
+DimPlot(ifnb_harmony, reduction = "umap", label = "T")
+```
+```{r cell-named}
+Idents(ifnb_harmony) <- ifnb_harmony$seurat_annotations
+
+DimPlot(ifnb_harmony, reduction = "umap", label = TRUE)
+```
+```{r, fig.width = 10, fig.height = 10}
+ifnb_harmony$celltype.cnd <- paste0(ifnb_harmony$seurat_annotations, "_", ifnb_harmony$stim)
+Idents(ifnb_harmony) <- ifnb_harmony$celltype.cnd
+
+DimPlot(ifnb_harmony, reduction = "umap", label = TRUE)
+```
+
+```{r find-different-markers}
+# View(ifnb_harmony@meta.data)
+b.treatment.response <- FindMarkers(ifnb_harmony, ident.1 = "CD16 Mono_STIM", ident2 = "CD16 Mono_CTRL")
+head(b.treatment.response)
+```
+```{r plot-markers, fig.width = 10, fig.height = 20}
+head(cluster3_marker)
+FeaturePlot(ifnb_harmony, features = c("FCGR3A", "MS4A4A", "AIF1", "IFIT1"), split.by = "stim", min.cutoff = "q10")
+```
+
